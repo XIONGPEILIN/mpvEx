@@ -61,6 +61,7 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     val client: NetworkClient,
     var fileSize: Long = -1L,
     var mimeType: String = "video/mp4",
+    var title: String? = null,
   )
 
   /**
@@ -73,6 +74,7 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     filePath: String,
     fileSize: Long = -1L,
     mimeType: String = "video/mp4",
+    title: String? = null,
   ): String {
     val client = NetworkClientFactory.createClient(connection)
 
@@ -82,11 +84,25 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
       client = client,
       fileSize = fileSize,
       mimeType = mimeType,
+      title = title,
     )
 
     activeStreams[streamId] = streamInfo
 
     return "http://127.0.0.1:$listeningPort/$streamId"
+  }
+
+  fun resolveDisplayName(url: String): String? {
+    try {
+      val uri = android.net.Uri.parse(url)
+      val streamId = uri.path?.removePrefix("/")?.split("/")?.firstOrNull()
+      if (!streamId.isNullOrEmpty()) {
+        return activeStreams[streamId]?.title
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "Error resolving display name for $url", e)
+    }
+    return null
   }
 
   /**

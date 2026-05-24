@@ -1,4 +1,4 @@
-﻿package app.marlboroadvance.mpvex.ui.player
+package app.marlboroadvance.mpvex.ui.player
 
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -139,6 +139,11 @@ class PlayerActivity :
   private val browserPreferences: BrowserPreferences by inject()
 
   /**
+   * Repository for managing network connections.
+   */
+  private val networkRepository: app.marlboroadvance.mpvex.repository.NetworkRepository by inject()
+
+  /**
    * Manager for file operations.
    */
   private val fileManager: FileManager by inject()
@@ -213,6 +218,21 @@ class PlayerActivity :
    * Used to skip thumbnail/metadata extraction for network streams.
    */
   private var isM3uPlaylist: Boolean = false
+
+  /**
+   * Title mapping for remote/network playlist items.
+   */
+  private val playlistTitles = java.util.concurrent.ConcurrentHashMap<Uri, String>()
+
+  /**
+   * Original network file path mapping for remote/network playlist items.
+   */
+  private val playlistNetworkFilePaths = java.util.concurrent.ConcurrentHashMap<Uri, String>()
+
+  /**
+   * Stream IDs registered with NetworkStreamingProxy that need to be cleaned up.
+   */
+  private val registeredStreamIds = java.util.concurrent.CopyOnWriteArrayList<String>()
 
   /**
    * Helper for managing Picture-in-Picture mode.
@@ -386,7 +406,12 @@ class PlayerActivity :
     // Only auto-generate playlist from folder if playlist mode is enabled and no playlist_id
     if (playlist.isEmpty() && playlistId == null && playerPreferences.playlistMode.get()) {
       val path = parsePathFromIntent(intent)
-      if (path != null) {
+      val networkFilePath = intent.getStringExtra("network_file_path")
+      val networkConnectionId = intent.getLongExtra("network_connection_id", -1L)
+
+      if (networkFilePath != null && networkConnectionId != -1L) {
+        generatePlaylistFromNetworkFolder(networkConnectionId, networkFilePath)
+      } else if (path != null) {
         generatePlaylistFromFolder(path)
       }
     }
@@ -559,6 +584,12 @@ class PlayerActivity :
   @RequiresApi(Build.VERSION_CODES.P)
   override fun onDestroy() {
     Log.d(TAG, "PlayerActivity onDestroy")
+
+    if (registeredStreamIds.isNotEmpty()) {
+      val proxy = app.marlboroadvance.mpvex.ui.browser.networkstreaming.proxy.NetworkStreamingProxy.getInstance()
+      registeredStreamIds.forEach { proxy.unregisterStream(it) }
+      registeredStreamIds.clear()
+    }
 
     runCatching {
       // OPTIMIZATION: Prevent any further UI updates or callbacks
@@ -1271,6 +1302,15 @@ class PlayerActivity :
   private fun extractFileNameFromUri(uri: Uri): String {
     // For HTTP/HTTPS URLs, extract from path (will be updated async via HTTP headers)
     if (HttpUtils.isNetworkStream(uri)) {
+      // Check if it's a proxy stream
+      val host = uri.host?.lowercase()
+      if (host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0") {
+        val proxyTitle = app.marlboroadvance.mpvex.ui.browser.networkstreaming.proxy.NetworkStreamingProxy.getInstance().resolveDisplayName(uri.toString())
+        if (proxyTitle != null) {
+          return proxyTitle
+        }
+      }
+
       // Get the last path segment and decode URL encoding
       val path = uri.path ?: return uri.host ?: "Network Stream"
       val lastSegment = path.substringAfterLast("/")
@@ -1748,7 +1788,8 @@ class PlayerActivity :
     if (subtitlesPreferences.autoloadMatchingSubtitles.get()) {
       lifecycleScope.launch {
         // For network files played via proxy (SMB/WebDAV/FTP), use the original network file path
-        val networkFilePath = intent.getStringExtra("network_file_path")
+        val currentUri = playlist.getOrNull(playlistIndex) ?: intent.data
+        val networkFilePath = currentUri?.let { playlistNetworkFilePaths[it] } ?: intent.getStringExtra("network_file_path")
         val networkConnectionId = intent.getLongExtra("network_connection_id", -1L)
 
         if (networkFilePath != null && networkConnectionId != -1L) {
@@ -3066,6 +3107,7 @@ class PlayerActivity :
    * Get file name from URI (used for playlist items)
    */
   private fun getFileNameFromUri(uri: Uri): String {
+    playlistTitles[uri]?.let { return it }
     getDisplayNameFromUri(uri)?.let { return it }
     return extractFileNameFromUri(uri)
   }
@@ -3122,7 +3164,7 @@ class PlayerActivity :
     name: String,
   ) {
     runCatching {
-      val filePath =
+      val filePath = playlistNetworkFilePaths[uri] ?:
         when (uri.scheme) {
           "file" -> {
             uri.path ?: uri.toString()
@@ -3241,6 +3283,13 @@ class PlayerActivity :
    * For network URIs (http/https/rtmp/etc.), uses a hash of the URI string to distinguish different streams.
    */
   private fun getMediaIdentifierFromUri(uri: Uri, fileName: String): String {
+    val networkConnectionId = intent.getLongExtra("network_connection_id", -1L)
+    val networkFilePath = playlistNetworkFilePaths[uri]
+    if (networkFilePath != null && networkConnectionId != -1L) {
+      val identifier = "network_${networkConnectionId}_${networkFilePath.hashCode()}"
+      Log.d(TAG, "Using network playlist item identifier: $identifier")
+      return identifier
+    }
     return if (uri.scheme?.startsWith("http") == true || uri.scheme == "rtmp" || uri.scheme == "ftp" || uri.scheme == "rtsp" || uri.scheme == "mms") {
       "${fileName}_${uri.toString().hashCode()}"
     } else {
@@ -3302,6 +3351,88 @@ class PlayerActivity :
       }
     }
   }
+
+  private fun generatePlaylistFromNetworkFolder(connectionId: Long, networkFilePath: String) {
+    lifecycleScope.launch(Dispatchers.IO) {
+      runCatching {
+        val connection = networkRepository.getConnectionById(connectionId) ?: return@runCatching
+
+        val parentPath = if (networkFilePath.contains("/")) {
+          networkFilePath.substringBeforeLast("/")
+        } else {
+          ""
+        }
+
+        val listResult = networkRepository.listFiles(connection, parentPath)
+        val files = listResult.getOrNull() ?: return@runCatching
+
+        val videoFiles = files.filter { file ->
+          !file.isDirectory && app.marlboroadvance.mpvex.utils.storage.FileTypeUtils.VIDEO_EXTENSIONS.contains(
+            file.name.substringAfterLast(".", "").lowercase()
+          )
+        }
+
+        if (videoFiles.size <= 1) return@runCatching
+
+        // Sort files naturally
+        val siblingFiles = videoFiles.sortedWith { f1, f2 ->
+          app.marlboroadvance.mpvex.utils.sort.SortUtils.NaturalOrderComparator.DEFAULT.compare(f1.name, f2.name)
+        }
+
+        val useProxy = connection.protocol in setOf(
+          app.marlboroadvance.mpvex.domain.network.NetworkProtocol.SMB,
+          app.marlboroadvance.mpvex.domain.network.NetworkProtocol.FTP,
+          app.marlboroadvance.mpvex.domain.network.NetworkProtocol.WEBDAV
+        )
+
+        val initialPlayableUri = getPlayableUri(intent)?.toUri()
+
+        val newPlaylist = mutableListOf<Uri>()
+        var newIndex = 0
+
+        siblingFiles.forEachIndexed { idx, file ->
+          val itemUri = if (file.path == networkFilePath && initialPlayableUri != null) {
+            newIndex = idx
+            initialPlayableUri
+          } else {
+            if (useProxy) {
+              val proxy = app.marlboroadvance.mpvex.ui.browser.networkstreaming.proxy.NetworkStreamingProxy.getInstance()
+              val streamId = "${connectionId}_${System.currentTimeMillis()}_${file.path.hashCode()}"
+              val proxyUrl = proxy.registerStream(
+                streamId = streamId,
+                connection = connection,
+                filePath = file.path,
+                fileSize = file.size,
+                mimeType = file.mimeType ?: "video/mp4",
+                title = file.name
+              )
+              registeredStreamIds.add(streamId)
+              Uri.parse(proxyUrl)
+            } else {
+              app.marlboroadvance.mpvex.ui.browser.networkstreaming.NetworkStreamingProvider.setConnection(connectionId, connection)
+              app.marlboroadvance.mpvex.ui.browser.networkstreaming.NetworkStreamingProvider.getUri(this@PlayerActivity, connectionId, file.path)
+            }
+          }
+          newPlaylist.add(itemUri)
+          playlistTitles[itemUri] = file.name
+          playlistNetworkFilePaths[itemUri] = file.path
+        }
+
+        withContext(Dispatchers.Main) {
+          playlist = newPlaylist
+          playlistIndex = newIndex
+          Log.d(TAG, "Network playlist generated: ${playlist.size} videos")
+          // Re-initialize shuffle if enabled
+          if (viewModel.shuffleEnabled.value) {
+            onShuffleToggled(true)
+          }
+        }
+      }.onFailure { e ->
+        Log.e(TAG, "Failed to generate network playlist", e)
+      }
+    }
+  }
+
 
   /**
    * Check if the current playlist is an M3U playlist (sourced from database).

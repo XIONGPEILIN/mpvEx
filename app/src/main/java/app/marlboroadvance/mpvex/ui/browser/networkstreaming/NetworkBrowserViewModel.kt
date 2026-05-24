@@ -93,6 +93,7 @@ class NetworkBrowserViewModel(
             filePath = file.path,
             fileSize = file.size,
             mimeType = file.mimeType ?: "video/mp4",
+            title = file.name,
           )
           android.net.Uri.parse(proxyUrl)
         } else {
